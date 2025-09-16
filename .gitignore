@@ -1,3 +1,4 @@
 *.json
 *.jsonl
 *.env
+*.pdf

@@ -504,3 +504,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+'''
+Without OpenAI: python3 mineru_to_canonical.py   --input mineru_JSON/Idiosyncratic_Retreats2_Practical_Implementation.json   --output chunks.jsonl   --doc-id mydoc
+With OpenAI: python3 mineru_to_canonical.py   --input mineru_JSON/Idiosyncratic_Retreats2_Practical_Implementation.json   --output chunks.jsonl   --doc-id mydoc   --use-vlm
+
+
+'''
