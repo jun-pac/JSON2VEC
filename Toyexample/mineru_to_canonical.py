@@ -28,6 +28,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple, Iterable, Optional
 
 try:
+    from openai import RateLimitError  # type: ignore
+except Exception:  # pragma: no cover - openai not always installed
+    RateLimitError = None  # type: ignore
+
+try:
     import requests
 except ImportError:
     requests = None  # We will guard usage
@@ -342,7 +347,34 @@ def _to_data_url(image_bytes: bytes, mime: str = "image/jpeg") -> str:
     b64 = base64.b64encode(image_bytes).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
-def _openai_caption_and_classify(image_bytes: bytes, filename_hint: str = "image.jpg", model: str = "gpt-4o-mini") -> Optional[Dict[str, Any]]:
+
+def _retry_delay_from_error(error: Exception, fallback: float, max_delay: float = 10.0) -> float:
+    """Extract retry delay hints from OpenAI rate limit errors."""
+    delay = fallback
+    if RateLimitError and isinstance(error, RateLimitError):
+        retry_after = getattr(error, "retry_after", None)
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except (TypeError, ValueError):
+                delay = fallback
+        else:
+            # try to parse textual hints like "try again in 264ms"
+            msg = str(error)
+            match_ms = re.search(r"try again in (\d+(?:\.\d+)?)ms", msg)
+            if match_ms:
+                delay = max(delay, float(match_ms.group(1)) / 1000.0)
+            else:
+                match_s = re.search(r"try again in (\d+(?:\.\d+)?)s", msg)
+                if match_s:
+                    delay = max(delay, float(match_s.group(1)))
+    return min(delay, max_delay)
+
+def _openai_caption_and_classify(
+    image_bytes: bytes,
+    filename_hint: str = "image.jpg",
+    model: str = "gpt-4o-mini"
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, int]]]:
     """
     Calls OpenAI chat.completions with a base64 data URL.
     Returns dict like: {"class": "chart|figure|diagram|screenshot|photo", "caption": "...", "keywords": [...]}
@@ -363,7 +395,7 @@ def _openai_caption_and_classify(image_bytes: bytes, filename_hint: str = "image
     prompt = (
         "You create retrieval metadata for document figures.\n"
         "1) Classify the image into one of: chart, plot, diagram, screenshot_of_text, photo, other.\n"
-        "2) Return a concise factual caption (<=40 words).\n"
+        "2) Return a concise factual caption (<=100 words).\n"
         "3) Return 3-8 keywords.\n"
         "If it's a chart/plot, include chart type, axes, and the main trend in the caption if visible.\n"
         "Output JSON ONLY with fields: {\"class\":\"...\",\"caption\":\"...\",\"keywords\":[\"...\"]}."
@@ -386,26 +418,39 @@ def _openai_caption_and_classify(image_bytes: bytes, filename_hint: str = "image
             max_tokens=220
         )
     except Exception as e:
+        if RateLimitError and isinstance(e, RateLimitError):
+            raise
         print("OpenAI API error:", e)
-        return None
+        return None, None
+
+    usage_summary: Optional[Dict[str, int]] = None
+    usage_obj = getattr(resp, "usage", None)
+    if usage_obj:
+        usage_summary = {
+            "input_tokens": getattr(usage_obj, "input_tokens", None) or 0,
+            "output_tokens": getattr(usage_obj, "output_tokens", None) or 0,
+            "total_tokens": getattr(usage_obj, "total_tokens", None) or 0,
+        }
 
     text = (resp.choices[0].message.content or "").strip()
     # try to parse a JSON block from the model content
     try:
         m = re.search(r'\{.*\}', text, re.S)
         if m:
-            return json.loads(m.group(0))
+            return json.loads(m.group(0)), usage_summary
     except Exception:
         pass
     # fallback: treat the whole string as caption
-    return {"class": "figure", "caption": text, "keywords": []}
+    return {"class": "figure", "caption": text, "keywords": []}, usage_summary
 
 def inject_vlm_metadata(
     objs: List[Dict[str, Any]],
     rate_limit_s: float = 0.6,
     model: str = "gpt-4o-mini",
-    classify: bool = True
-) -> List[Dict[str, Any]]:
+    classify: bool = True,
+    tpm_limit: Optional[int] = 200_000,
+    max_retries: int = 5,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     For each figure/chart block, call OpenAI to classify and caption the visual.
     Updates include:
@@ -414,6 +459,13 @@ def inject_vlm_metadata(
       - object_type -> 'chart' if classification returns chart/plot
     """
     updated: List[Dict[str, Any]] = []
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    tokens_per_second_limit: Optional[float] = None
+    if tpm_limit:
+        try:
+            tokens_per_second_limit = float(tpm_limit) / 60.0
+        except (TypeError, ValueError):
+            tokens_per_second_limit = None
     for o in objs:
         o2 = dict(o)
         is_fig_or_chart = o2.get("object_type") in ("figure", "chart")
@@ -424,7 +476,38 @@ def inject_vlm_metadata(
             if not img_bytes:
                 print(f"[warn] unable to load image bytes for {img_ref}")
             else:
-                result = _openai_caption_and_classify(img_bytes, filename_hint=img_ref, model=model)
+                attempts = 0
+                result: Optional[Dict[str, Any]] = None
+                usage_summary: Optional[Dict[str, int]] = None
+                while attempts < max_retries:
+                    try:
+                        result, usage_summary = _openai_caption_and_classify(
+                            img_bytes,
+                            filename_hint=img_ref,
+                            model=model,
+                        )
+                        attempts += 1
+                        break
+                    except Exception as exc:
+                        attempts += 1
+                        if RateLimitError and isinstance(exc, RateLimitError):
+                            if attempts >= max_retries:
+                                print(
+                                    f"[error] Rate limit persists for {img_ref}; "
+                                    f"giving up after {max_retries} attempts."
+                                )
+                                break
+                            base_wait = max(rate_limit_s, 1.0) * (2 ** (attempts - 1))
+                            wait_s = _retry_delay_from_error(exc, base_wait)
+                            print(
+                                f"[warn] Rate limit reached for {img_ref}, "
+                                f"sleeping {wait_s:.2f}s before retry ({attempts}/{max_retries})."
+                            )
+                            time.sleep(wait_s)
+                            continue
+                        # Any non rate-limit error is logged upstream; abort this image.
+                        break
+
                 if result:
                     o2["generated_desc"] = result.get("caption")
                     img_class = (result.get("class") or "").lower()
@@ -449,10 +532,22 @@ def inject_vlm_metadata(
                     if cap_for_render:
                         o2["render_for_embedding"] = f"caption: {cap_for_render}\n{text}".strip()
 
-                time.sleep(rate_limit_s)
+                    if usage_summary:
+                        o2.setdefault("attrs", {}).setdefault("vlm", {})["token_usage"] = usage_summary
+                        for key, value in usage_summary.items():
+                            usage_totals[key] = usage_totals.get(key, 0) + (value or 0)
+
+                if attempts:
+                    sleep_for = rate_limit_s
+                    if tokens_per_second_limit and usage_summary:
+                        total_tokens = usage_summary.get("total_tokens") or 0
+                        if total_tokens > 0 and tokens_per_second_limit > 0:
+                            sleep_for = max(rate_limit_s, total_tokens / tokens_per_second_limit)
+                    time.sleep(sleep_for)
 
         updated.append(o2)
-    return updated
+    usage_totals = {k: v for k, v in usage_totals.items() if v}
+    return updated, usage_totals
 
 # ============== I/O helpers ==============
 
@@ -477,6 +572,8 @@ def main():
     ap.add_argument("--openai-model", default="gpt-4o-mini", help="OpenAI vision model (e.g., gpt-4o-mini or gpt-4o)")
     ap.add_argument("--no-classify", action="store_true", help="Do not change object_type based on VLM classification")
     ap.add_argument("--rate-limit", type=float, default=0.6, help="Seconds to sleep between VLM calls")
+    ap.add_argument("--tpm-limit", type=int, default=200_000, help="Approximate tokens-per-minute quota to respect")
+    ap.add_argument("--max-retries", type=int, default=5, help="Maximum retries when hitting OpenAI rate limits")
     ap.add_argument("--format", choices=["jsonl","json"], default="json", help="Output format")
     args = ap.parse_args()
 
@@ -487,12 +584,15 @@ def main():
 
     objs = flatten_mineru(mineru_raw, doc_id=args.doc_id, dedup=(not args.no_dedup))
 
+    usage_summary: Dict[str, int] = {}
     if args.use_vlm:
-        objs = inject_vlm_metadata(
+        objs, usage_summary = inject_vlm_metadata(
             objs,
             rate_limit_s=args.rate_limit,
             model=args.openai_model,
-            classify=not args.no_classify
+            classify=not args.no_classify,
+            tpm_limit=args.tpm_limit,
+            max_retries=args.max_retries,
         )
 
     if args.format == "jsonl":
@@ -501,13 +601,20 @@ def main():
         _save_json(objs, args.output)
 
     print(f"Wrote {len(objs)} objects to {args.output}")
+    if usage_summary:
+        print(
+            "OpenAI usage (input/output/total tokens): "
+            f"{usage_summary.get('input_tokens', 0)}/"
+            f"{usage_summary.get('output_tokens', 0)}/"
+            f"{usage_summary.get('total_tokens', 0)}"
+        )
 
 if __name__ == "__main__":
     main()
 
 '''
 Without OpenAI: python3 mineru_to_canonical.py   --input mineru_JSON/Idiosyncratic_Retreats2_Practical_Implementation.json   --output chunks.jsonl   --doc-id mydoc
-With OpenAI: python3 mineru_to_canonical.py   --input mineru_JSON/Idiosyncratic_Retreats2_Practical_Implementation.json   --output chunks.jsonl   --doc-id mydoc   --use-vlm
+With OpenAI: python3 mineru_to_canonical.py   --input mineru_JSON/0802_meeting_MinerU__20250916222720.json   --output chunks.jsonl   --doc-id mydoc   --use-vlm
 
 
 '''
